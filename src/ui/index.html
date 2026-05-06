@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>App Builder Chatbot</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="chat-region" aria-label="Chat">
+        <header class="topbar">
+          <div>
+            <h1>App Builder Chatbot</h1>
+            <p id="statusText">Collecting requirements</p>
+          </div>
+          <button id="newConversationButton" type="button">New</button>
+        </header>
+
+        <div id="messages" class="messages" aria-live="polite"></div>
+
+        <form id="chatForm" class="composer">
+          <label class="sr-only" for="messageInput">Message</label>
+          <textarea id="messageInput" rows="3" placeholder="Describe the app you want to build"></textarea>
+          <button id="sendButton" type="submit">Send</button>
+        </form>
+      </section>
+
+      <aside class="spec-panel" aria-label="Current app specification">
+        <div class="panel-header">
+          <h2>Current Spec</h2>
+          <span id="conversationIdBadge"></span>
+        </div>
+        <dl id="specDetails" class="spec-details"></dl>
+        <section class="missing-section">
+          <h3>Missing</h3>
+          <ul id="missingFields"></ul>
+        </section>
+      </aside>
+    </main>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

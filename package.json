@@ -1,0 +1,32 @@
+{
+  "name": "ai-chatbot-v2",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TypeScript app-building chatbot powered by Amazon Bedrock",
+  "scripts": {
+    "dev": "tsx src/server.ts",
+    "build": "tsc && npm run copy-ui",
+    "copy-ui": "node scripts/copy-ui.mjs",
+    "start": "node dist/server.js",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src test"
+  },
+  "dependencies": {
+    "@aws-sdk/client-bedrock-runtime": "^3.812.0",
+    "@fastify/static": "^9.1.3",
+    "dotenv": "^16.5.0",
+    "fastify": "^5.3.3",
+    "pino": "^9.6.0",
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.26.0",
+    "@types/node": "^22.15.17",
+    "eslint": "^9.26.0",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.32.0",
+    "vitest": "^3.1.3"
+  }
+}
