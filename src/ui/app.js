@@ -424,7 +424,7 @@ function renderSpec(spec, requiredFields = defaultRequiredFields) {
     ["appName", "Name", spec.appName],
     ["purpose", "Purpose", spec.purpose],
     ["appType", "Type", spec.appType],
-    ["deploymentTarget", "Target", spec.deploymentTarget],
+    ["deploymentTarget", "Platform", spec.deploymentTarget],
     ["targetUsers", "Users", spec.targetUsers],
     ["coreFeatures", "Features", spec.coreFeatures],
     ["dataEntities", "Entities", spec.dataEntities],

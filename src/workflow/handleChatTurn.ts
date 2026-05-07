@@ -94,6 +94,23 @@ async function handleChatTurnInternal(
     return handleConfirmationTurn(state, input, contextWindow, telemetry, startedAt);
   }
 
+  if (state.status === "created") {
+    const response = getPostCreationCasualResponse(input.message, state);
+    if (response) {
+      return saveAndRespond(input.repository, state, response, contextWindow, telemetry, startedAt);
+    }
+  }
+
+  return handleRequirementCollectionTurn(state, input, contextWindow, telemetry, startedAt);
+}
+
+async function handleRequirementCollectionTurn(
+  state: ConversationState,
+  input: HandleChatTurnInput,
+  contextWindow: ContextWindowOptions,
+  telemetry: Telemetry,
+  startedAt: number
+): Promise<ChatTurnResponse> {
   if (getContextWindowUsage(state, contextWindow).status === "blocked") {
     telemetry.event("context_window_blocked", {
       conversationId: state.conversationId,
@@ -102,39 +119,7 @@ async function handleChatTurnInternal(
     return saveAndRespond(input.repository, state, getContextLimitMessage(), contextWindow, telemetry, startedAt);
   }
 
-  telemetry.event("requirement_extraction_started", {
-    conversationId: state.conversationId,
-    userId: state.userId ?? null,
-    missingFields: state.missingFields
-  });
-
-  let extracted: Partial<AppSpec>;
-  try {
-    extracted = await input.llmClient.extractAppSpec({
-      userMessage: input.message,
-      currentSpec: state.appSpec,
-      missingFields: state.missingFields
-    });
-  } catch (error) {
-    telemetry.event("requirement_extraction_failed", {
-      conversationId: state.conversationId,
-      userId: state.userId ?? null,
-      ...getErrorAttributes(error)
-    });
-    telemetry.metric("llm_request_failure_count", 1, {
-      conversationId: state.conversationId,
-      task: "extract_app_spec"
-    });
-    throw error;
-  }
-
-  extracted = addDeterministicExtraction(input.message, extracted);
-
-  telemetry.event("requirement_extraction_completed", {
-    conversationId: state.conversationId,
-    userId: state.userId ?? null,
-    extractedFieldCount: countExtractedFields(extracted)
-  });
+  const extracted = await extractRequirements(state, input, telemetry);
 
   const casualResponse = countExtractedFields(extracted) === 0 ? getCasualResponse(input.message) : undefined;
   if (casualResponse) {
@@ -145,6 +130,17 @@ async function handleChatTurnInternal(
     return saveAndRespond(input.repository, state, casualResponse, contextWindow, telemetry, startedAt);
   }
 
+  return applyRequirementsAndRespond(state, input, contextWindow, telemetry, startedAt, extracted);
+}
+
+async function applyRequirementsAndRespond(
+  state: ConversationState,
+  input: HandleChatTurnInput,
+  contextWindow: ContextWindowOptions,
+  telemetry: Telemetry,
+  startedAt: number,
+  extracted: Partial<AppSpec>
+): Promise<ChatTurnResponse> {
   state.appSpec = mergeAppSpec(state.appSpec, extracted);
   state.missingFields = getMissingFields(state.appSpec);
   telemetry.event("missing_fields_evaluated", {
@@ -191,7 +187,24 @@ async function handleConfirmationTurn(
   telemetry: Telemetry,
   startedAt: number
 ): Promise<ChatTurnResponse> {
-  const decision = await classifyConfirmation(state, input, contextWindow);
+  const deterministicDecision = classifyConfirmationDeterministically(input.message);
+  let decision = deterministicDecision;
+
+  if (deterministicDecision === "ambiguous") {
+    const requirementChangeResponse = await tryHandleConfirmationRequirementChange(
+      state,
+      input,
+      contextWindow,
+      telemetry,
+      startedAt
+    );
+    if (requirementChangeResponse) {
+      return requirementChangeResponse;
+    }
+
+    decision = await classifyConfirmation(state, input, contextWindow);
+  }
+
   telemetry.event("confirmation_received", {
     conversationId: state.conversationId,
     userId: state.userId ?? null,
@@ -274,6 +287,75 @@ async function handleConfirmationTurn(
   }
 }
 
+async function tryHandleConfirmationRequirementChange(
+  state: ConversationState,
+  input: HandleChatTurnInput,
+  contextWindow: ContextWindowOptions,
+  telemetry: Telemetry,
+  startedAt: number
+): Promise<ChatTurnResponse | undefined> {
+  if (getContextWindowUsage(state, contextWindow).status === "blocked") {
+    return undefined;
+  }
+
+  const extracted = await extractRequirements(state, input, telemetry);
+  if (countExtractedFields(extracted) === 0) {
+    return undefined;
+  }
+
+  state.confirmed = false;
+  state.readyToBuild = false;
+  telemetry.event("confirmation_requirement_change_detected", {
+    conversationId: state.conversationId,
+    userId: state.userId ?? null,
+    extractedFieldCount: countExtractedFields(extracted)
+  });
+
+  return applyRequirementsAndRespond(state, input, contextWindow, telemetry, startedAt, extracted);
+}
+
+async function extractRequirements(
+  state: ConversationState,
+  input: HandleChatTurnInput,
+  telemetry: Telemetry
+): Promise<Partial<AppSpec>> {
+  telemetry.event("requirement_extraction_started", {
+    conversationId: state.conversationId,
+    userId: state.userId ?? null,
+    missingFields: state.missingFields
+  });
+
+  let extracted: Partial<AppSpec>;
+  try {
+    extracted = await input.llmClient.extractAppSpec({
+      userMessage: input.message,
+      currentSpec: state.appSpec,
+      missingFields: state.missingFields
+    });
+  } catch (error) {
+    telemetry.event("requirement_extraction_failed", {
+      conversationId: state.conversationId,
+      userId: state.userId ?? null,
+      ...getErrorAttributes(error)
+    });
+    telemetry.metric("llm_request_failure_count", 1, {
+      conversationId: state.conversationId,
+      task: "extract_app_spec"
+    });
+    throw error;
+  }
+
+  extracted = addDeterministicExtraction(input.message, extracted);
+
+  telemetry.event("requirement_extraction_completed", {
+    conversationId: state.conversationId,
+    userId: state.userId ?? null,
+    extractedFieldCount: countExtractedFields(extracted)
+  });
+
+  return extracted;
+}
+
 async function classifyConfirmation(
   state: ConversationState,
   input: HandleChatTurnInput,
@@ -337,19 +419,45 @@ function getContextLimitMessage(): string {
 
 function addDeterministicExtraction(message: string, extracted: Partial<AppSpec>): Partial<AppSpec> {
   const deploymentTarget = normalizePlatformDeploymentTarget(message);
+  const authRequired = getDeterministicAuthRequirement(message);
+  const next = { ...extracted };
 
-  if (!deploymentTarget || hasValue(extracted.deploymentTarget)) {
-    return extracted;
+  if (deploymentTarget && !hasValue(next.deploymentTarget)) {
+    next.deploymentTarget = deploymentTarget;
   }
 
-  return {
-    ...extracted,
-    deploymentTarget
-  };
+  if (authRequired !== undefined && !hasValue(next.authRequired)) {
+    next.authRequired = authRequired;
+  }
+
+  return next;
+}
+
+function getDeterministicAuthRequirement(message: string): boolean | undefined {
+  const normalized = message.trim().toLowerCase();
+  if (!normalized) {
+    return undefined;
+  }
+
+  const authPattern = /\b(auth|authentication|login|log in|sign in|signin|sign-in|single sign-on|sso|user accounts?)\b/;
+  if (!authPattern.test(normalized)) {
+    return undefined;
+  }
+
+  const disabledPattern = /\b(no|without|skip|disable|exclude)\b.{0,40}\b(auth|authentication|login|log in|sign in|signin|sign-in|single sign-on|sso|user accounts?)\b|\b(do not|don't|dont|doesn't|does not|won't|will not|no need to|no need for)\b.{0,40}\b(auth|authentication|login|log in|sign in|signin|sign-in|single sign-on|sso|user accounts?)\b/;
+  if (disabledPattern.test(normalized)) {
+    return false;
+  }
+
+  return true;
 }
 
 function getCasualResponse(message: string): string | undefined {
   const normalized = message.trim().toLowerCase();
+
+  if (/^(thanks|thank you|thx)\b/.test(normalized)) {
+    return "You're welcome. Tell me what you want to adjust next, or start a new conversation when you're ready for another app.";
+  }
 
   if (/\bhow are you\b/.test(normalized)) {
     return "I'm doing well and ready to help with an app plan. What kind of app do you want to build, and what should it help users do?";
@@ -372,6 +480,19 @@ function getCasualResponse(message: string): string | undefined {
   }
 
   return undefined;
+}
+
+function getPostCreationCasualResponse(message: string, state: ConversationState): string | undefined {
+  const normalized = message.trim().toLowerCase();
+  if (!/^(thanks|thank you|thx)\b/.test(normalized)) {
+    return undefined;
+  }
+
+  if (state.createdAppUrl) {
+    return `You're welcome. The created app is still available at ${state.createdAppUrl}.`;
+  }
+
+  return "You're welcome. The app has been created.";
 }
 
 function countExtractedFields(extracted: Partial<AppSpec>): number {
