@@ -537,6 +537,9 @@ function renderMetrics(metrics) {
   const extractionFailures = metrics.extractionFailures || {};
   const confirmations = metrics.confirmations || {};
   const appCreation = metrics.appCreation || {};
+  const privacy = metrics.privacy || {};
+  const jailbreakResistance = metrics.jailbreakResistance || {};
+  const contentSafety = metrics.contentSafety || {};
   const decisions = confirmations.decisions || {};
 
   metricsUpdatedAt.textContent = formatMetricsUpdatedAt(metrics.generatedAt);
@@ -560,6 +563,11 @@ function renderMetrics(metrics) {
       value: `${formatWholeNumber(appCreation.success)} created / ${formatWholeNumber(appCreation.failure)} failed`
     },
     {
+      label: "Guardrails",
+      value: `${formatWholeNumber(privacy.redactions)} redacted / ${formatWholeNumber(jailbreakResistance.detected)} jailbreak / ${formatWholeNumber(contentSafety.blocked)} safety`,
+      title: `${formatWholeNumber(jailbreakResistance.blocked)} jailbreak blocked, ${formatWholeNumber(jailbreakResistance.sanitized)} sanitized`
+    },
+    {
       label: "Turn Latency",
       value: formatLatencySummary(turns.latencyMs)
     },
@@ -576,7 +584,8 @@ function renderMetricsUnavailable() {
     { label: "Turns", value: "-" },
     { label: "Extraction", value: "-" },
     { label: "Confirm", value: "-" },
-    { label: "Creation", value: "-" }
+    { label: "Creation", value: "-" },
+    { label: "Guardrails", value: "-" }
   ]);
 }
 

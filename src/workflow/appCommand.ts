@@ -1,4 +1,6 @@
 import type { AppSpec } from "../domain/appSpec";
+import { assessAppSpecSafety } from "../domain/contentSafety";
+import { assessAppSpecJailbreak } from "../domain/jailbreakResistance";
 import type { ConversationState } from "../domain/conversationState";
 import { getMissingFields } from "../domain/validation";
 import type { CreateAppResult } from "../appBuilder/appBuilderClient";
@@ -86,6 +88,16 @@ export function planCreateAppCommand(state: ConversationState): CreateAppCommand
   const missingFields = getMissingFields(state.appSpec);
   if (missingFields.length > 0) {
     throw new Error(`Cannot plan app creation with missing fields: ${missingFields.join(", ")}`);
+  }
+
+  const jailbreak = assessAppSpecJailbreak(state.appSpec);
+  if (jailbreak.detected) {
+    throw new Error("Cannot plan app creation because the app spec violates jailbreak resistance policy.");
+  }
+
+  const contentSafety = assessAppSpecSafety(state.appSpec);
+  if (!contentSafety.allowed) {
+    throw new Error("Cannot plan app creation because the app spec violates content safety policy.");
   }
 
   const plannedAt = new Date().toISOString();

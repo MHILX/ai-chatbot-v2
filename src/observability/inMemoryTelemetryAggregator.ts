@@ -39,6 +39,18 @@ export interface MetricsSnapshot {
     redactions: number;
     byBoundary: Record<string, number>;
   };
+  contentSafety: {
+    blocked: number;
+    byBoundary: Record<string, number>;
+    byCategory: Record<string, number>;
+  };
+  jailbreakResistance: {
+    detected: number;
+    blocked: number;
+    sanitized: number;
+    byBoundary: Record<string, number>;
+    byCategory: Record<string, number>;
+  };
 }
 
 export interface MetricsSnapshotProvider {
@@ -74,6 +86,14 @@ export class InMemoryTelemetryAggregator implements Telemetry, MetricsSnapshotPr
   private readonly appBuilderLatency: LatencyAccumulator = createLatencyAccumulator();
   private privacyRedactions = 0;
   private readonly redactionsByBoundary: Record<string, number> = {};
+  private contentSafetyBlocked = 0;
+  private readonly contentSafetyByBoundary: Record<string, number> = {};
+  private readonly contentSafetyByCategory: Record<string, number> = {};
+  private jailbreakDetected = 0;
+  private jailbreakBlocked = 0;
+  private jailbreakSanitized = 0;
+  private readonly jailbreakByBoundary: Record<string, number> = {};
+  private readonly jailbreakByCategory: Record<string, number> = {};
 
   event(name: string, attributes: TelemetryAttributes = {}): void {
     this.touch();
@@ -147,6 +167,29 @@ export class InMemoryTelemetryAggregator implements Telemetry, MetricsSnapshotPr
     if (name === "sensitive_data_redaction_count") {
       this.privacyRedactions += countValue;
       incrementRecord(this.redactionsByBoundary, getStringAttribute(attributes, "boundary", "unknown"), countValue);
+      return;
+    }
+
+    if (name === "content_safety_block_count") {
+      this.contentSafetyBlocked += countValue;
+      incrementRecord(this.contentSafetyByBoundary, getStringAttribute(attributes, "boundary", "unknown"), countValue);
+      for (const category of getStringArrayAttribute(attributes, "categories")) {
+        incrementRecord(this.contentSafetyByCategory, category, countValue);
+      }
+      return;
+    }
+
+    if (name === "jailbreak_attempt_count") {
+      this.jailbreakDetected += countValue;
+      if (getStringAttribute(attributes, "outcome", "sanitized") === "blocked") {
+        this.jailbreakBlocked += countValue;
+      } else {
+        this.jailbreakSanitized += countValue;
+      }
+      incrementRecord(this.jailbreakByBoundary, getStringAttribute(attributes, "boundary", "unknown"), countValue);
+      for (const category of getStringArrayAttribute(attributes, "categories")) {
+        incrementRecord(this.jailbreakByCategory, category, countValue);
+      }
     }
   }
 
@@ -186,6 +229,18 @@ export class InMemoryTelemetryAggregator implements Telemetry, MetricsSnapshotPr
       privacy: {
         redactions: this.privacyRedactions,
         byBoundary: { ...this.redactionsByBoundary }
+      },
+      contentSafety: {
+        blocked: this.contentSafetyBlocked,
+        byBoundary: { ...this.contentSafetyByBoundary },
+        byCategory: { ...this.contentSafetyByCategory }
+      },
+      jailbreakResistance: {
+        detected: this.jailbreakDetected,
+        blocked: this.jailbreakBlocked,
+        sanitized: this.jailbreakSanitized,
+        byBoundary: { ...this.jailbreakByBoundary },
+        byCategory: { ...this.jailbreakByCategory }
       }
     };
   }
@@ -231,6 +286,11 @@ function incrementRecord(record: Record<string, number>, key: string, amount: nu
 function getStringAttribute(attributes: TelemetryAttributes, key: string, fallback: string): string {
   const value = attributes[key];
   return typeof value === "string" && value.trim() ? value : fallback;
+}
+
+function getStringArrayAttribute(attributes: TelemetryAttributes, key: string): string[] {
+  const value = attributes[key];
+  return Array.isArray(value) ? value.filter((item) => item.trim()) : [];
 }
 
 function getConfirmationDecision(attributes: TelemetryAttributes): "yes" | "no" | "ambiguous" {

@@ -6,6 +6,7 @@ export const conversationStatuses = [
   "awaiting_confirmation",
   "creating_app",
   "created",
+  "blocked",
   "failed",
   "cancelled"
 ] as const;

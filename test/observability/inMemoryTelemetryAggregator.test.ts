@@ -20,6 +20,9 @@ describe("InMemoryTelemetryAggregator", () => {
     telemetry.metric("app_builder_latency_ms", 150, { conversationId: "conv_1" });
     telemetry.metric("sensitive_data_redaction_count", 2, { boundary: "user_message" });
     telemetry.metric("sensitive_data_redaction_count", 1, { boundary: "app_builder_result" });
+    telemetry.metric("content_safety_block_count", 1, { boundary: "user_message", categories: ["cyber_abuse"] });
+    telemetry.metric("jailbreak_attempt_count", 1, { boundary: "user_message", outcome: "blocked", categories: ["prompt_exfiltration"] });
+    telemetry.metric("jailbreak_attempt_count", 1, { boundary: "llm_extraction", outcome: "sanitized", categories: ["instruction_override"] });
 
     expect(telemetry.snapshot()).toMatchObject({
       turns: {
@@ -67,6 +70,28 @@ describe("InMemoryTelemetryAggregator", () => {
         byBoundary: {
           user_message: 2,
           app_builder_result: 1
+        }
+      },
+      contentSafety: {
+        blocked: 1,
+        byBoundary: {
+          user_message: 1
+        },
+        byCategory: {
+          cyber_abuse: 1
+        }
+      },
+      jailbreakResistance: {
+        detected: 2,
+        blocked: 1,
+        sanitized: 1,
+        byBoundary: {
+          user_message: 1,
+          llm_extraction: 1
+        },
+        byCategory: {
+          prompt_exfiltration: 1,
+          instruction_override: 1
         }
       }
     });

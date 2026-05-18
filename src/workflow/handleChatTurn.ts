@@ -8,6 +8,21 @@ import {
 } from "../domain/appSpec";
 import { classifyConfirmationDeterministically } from "../domain/confirmation";
 import {
+  assessAppSpecSafety,
+  assessContentSafetyText,
+  getContentSafetyAssistantFallback,
+  getContentSafetyBlockedMessage,
+  type ContentSafetyAssessment
+} from "../domain/contentSafety";
+import {
+  assessAppSpecJailbreak,
+  assessJailbreakText,
+  assessPartialAppSpecJailbreak,
+  getJailbreakAssistantFallback,
+  getJailbreakBlockedMessage,
+  type JailbreakAssessment
+} from "../domain/jailbreakResistance";
+import {
   appendMessage,
   type ChatMessage,
   createConversationState,
@@ -106,18 +121,36 @@ async function handleChatTurnInternal(
       conversationId: state.conversationId
     });
   }
-  appendMessage(state, "user", safeInput.message);
+
+  const userMessageJailbreak = assessJailbreakText(safeInput.message);
+  if (userMessageJailbreak.detected) {
+    emitJailbreakTelemetry(telemetry, state.conversationId, state.userId, "user_message", userMessageJailbreak);
+  }
+  if (!userMessageJailbreak.allowed) {
+    return blockJailbreakTurn(safeInput, state, contextWindow, telemetry, startedAt, true);
+  }
+
+  const guardedInput = userMessageJailbreak.action === "sanitize"
+    ? { ...safeInput, message: userMessageJailbreak.sanitizedText }
+    : safeInput;
+
+  const userMessageSafety = assessContentSafetyText(guardedInput.message);
+  if (!userMessageSafety.allowed) {
+    return blockUnsafeTurn(guardedInput, state, contextWindow, telemetry, startedAt, "user_message", userMessageSafety, true);
+  }
+
+  appendMessage(state, "user", guardedInput.message);
   compactConversationForContext(state, contextWindow);
 
   if (state.status === "awaiting_confirmation") {
-    return handleConfirmationTurn(state, safeInput, contextWindow, telemetry, startedAt);
+    return handleConfirmationTurn(state, guardedInput, contextWindow, telemetry, startedAt);
   }
 
   if (state.status === "created") {
-    return saveAndRespond(safeInput, state, getCreatedConversationResponse(safeInput.message, state), contextWindow, telemetry, startedAt);
+    return saveAndRespond(guardedInput, state, getCreatedConversationResponse(guardedInput.message, state), contextWindow, telemetry, startedAt);
   }
 
-  return handleRequirementCollectionTurn(state, safeInput, contextWindow, telemetry, startedAt);
+  return handleRequirementCollectionTurn(state, guardedInput, contextWindow, telemetry, startedAt);
 }
 
 async function handleRequirementCollectionTurn(
@@ -157,7 +190,23 @@ async function applyRequirementsAndRespond(
   startedAt: number,
   extracted: Partial<AppSpec>
 ): Promise<ChatTurnResponse> {
-  state.appSpec = mergeAppSpec(state.appSpec, extracted);
+  const mergedSpec = mergeAppSpec(state.appSpec, extracted);
+  const appSpecJailbreak = assessAppSpecJailbreak(mergedSpec);
+  if (appSpecJailbreak.detected) {
+    emitJailbreakTelemetry(telemetry, state.conversationId, state.userId, "app_spec", appSpecJailbreak);
+  }
+  if (!appSpecJailbreak.allowed) {
+    state.appSpec = appSpecJailbreak.sanitizedAppSpec;
+    return blockJailbreakTurn(input, state, contextWindow, telemetry, startedAt);
+  }
+
+  const candidateSpec = appSpecJailbreak.sanitizedAppSpec;
+  const appSpecSafety = assessAppSpecSafety(candidateSpec);
+  if (!appSpecSafety.allowed) {
+    return blockUnsafeTurn(input, state, contextWindow, telemetry, startedAt, "app_spec", appSpecSafety);
+  }
+
+  state.appSpec = candidateSpec;
   state.missingFields = getMissingFields(state.appSpec);
   telemetry.event("missing_fields_evaluated", {
     conversationId: state.conversationId,
@@ -245,6 +294,18 @@ async function handleConfirmationTurn(
   state.status = "creating_app";
   state.missingFields = getMissingFields(state.appSpec);
 
+  const appSpecJailbreak = assessAppSpecJailbreak(state.appSpec);
+  if (appSpecJailbreak.detected) {
+    emitJailbreakTelemetry(telemetry, state.conversationId, state.userId, "app_spec", appSpecJailbreak);
+    state.appSpec = appSpecJailbreak.sanitizedAppSpec;
+    state.missingFields = getMissingFields(state.appSpec);
+  }
+  if (!appSpecJailbreak.allowed) {
+    state.confirmed = false;
+    state.readyToBuild = false;
+    return blockJailbreakTurn(input, state, contextWindow, telemetry, startedAt);
+  }
+
   if (state.missingFields.length > 0) {
     state.confirmed = false;
     state.readyToBuild = false;
@@ -254,6 +315,13 @@ async function handleConfirmationTurn(
       missingFields: state.missingFields
     });
     return saveAndRespond(input, state, response, contextWindow, telemetry, startedAt);
+  }
+
+  const appSpecSafety = assessAppSpecSafety(state.appSpec);
+  if (!appSpecSafety.allowed) {
+    state.confirmed = false;
+    state.readyToBuild = false;
+    return blockUnsafeTurn(input, state, contextWindow, telemetry, startedAt, "app_spec", appSpecSafety);
   }
 
   const command = planCreateAppCommand(state);
@@ -380,7 +448,11 @@ function validateExtractedRequirements(
   if (parsed.success) {
     const redacted = redactSensitiveValue(parsed.data);
     emitRedactionTelemetry(telemetry, state.conversationId, state.userId, "llm_extraction", redacted.findings);
-    return redacted.value;
+    const jailbreak = assessPartialAppSpecJailbreak(redacted.value);
+    if (jailbreak.detected) {
+      emitJailbreakTelemetry(telemetry, state.conversationId, state.userId, "llm_extraction", jailbreak);
+    }
+    return jailbreak.sanitizedAppSpec;
   }
 
   telemetry.event("llm_extracted_requirements_rejected", {
@@ -405,8 +477,17 @@ async function saveAndRespond(
   createdApp?: ChatTurnResponse["createdApp"]
 ): Promise<ChatTurnResponse> {
   const messageRedaction = redactSensitiveText(message);
-  const safeMessage = messageRedaction.value;
+  const assistantSafety = assessContentSafetyText(messageRedaction.value);
+  let safeMessage = assistantSafety.allowed ? messageRedaction.value : getContentSafetyAssistantFallback();
   emitRedactionTelemetry(telemetry, state.conversationId, state.userId, "assistant_message", messageRedaction.findings);
+  if (!assistantSafety.allowed) {
+    emitContentSafetyTelemetry(telemetry, state.conversationId, state.userId, "assistant_message", assistantSafety);
+  }
+  const assistantJailbreak = assessJailbreakText(safeMessage);
+  if (assistantJailbreak.detected) {
+    emitJailbreakTelemetry(telemetry, state.conversationId, state.userId, "assistant_message", assistantJailbreak);
+    safeMessage = getJailbreakAssistantFallback();
+  }
   appendMessage(state, "assistant", safeMessage);
   compactConversationForContext(state, contextWindow);
   const userPreferences = await saveUserPreferences(input.userPreferencesRepository, state);
@@ -438,6 +519,90 @@ async function saveAndRespond(
     userPreferences,
     commands
   };
+}
+
+async function blockUnsafeTurn(
+  input: HandleChatTurnInput,
+  state: ConversationState,
+  contextWindow: ContextWindowOptions,
+  telemetry: Telemetry,
+  startedAt: number,
+  boundary: string,
+  assessment: ContentSafetyAssessment,
+  appendUserPlaceholder = false
+): Promise<ChatTurnResponse> {
+  state.confirmed = false;
+  state.readyToBuild = false;
+  state.status = "blocked";
+  state.missingFields = getMissingFields(state.appSpec);
+  if (appendUserPlaceholder) {
+    appendMessage(state, "user", "[Blocked user request omitted by content safety]");
+  }
+  emitContentSafetyTelemetry(telemetry, state.conversationId, state.userId, boundary, assessment);
+  return saveAndRespond(input, state, getContentSafetyBlockedMessage(), contextWindow, telemetry, startedAt);
+}
+
+async function blockJailbreakTurn(
+  input: HandleChatTurnInput,
+  state: ConversationState,
+  contextWindow: ContextWindowOptions,
+  telemetry: Telemetry,
+  startedAt: number,
+  appendUserPlaceholder = false
+): Promise<ChatTurnResponse> {
+  state.confirmed = false;
+  state.readyToBuild = false;
+  state.status = "blocked";
+  state.missingFields = getMissingFields(state.appSpec);
+  if (appendUserPlaceholder) {
+    appendMessage(state, "user", "[Blocked user request omitted by jailbreak resistance]");
+  }
+  return saveAndRespond(input, state, getJailbreakBlockedMessage(), contextWindow, telemetry, startedAt);
+}
+
+function emitContentSafetyTelemetry(
+  telemetry: Telemetry,
+  conversationId: string,
+  userId: string | null | undefined,
+  boundary: string,
+  assessment: ContentSafetyAssessment
+): void {
+  telemetry.event("content_safety_blocked", {
+    conversationId,
+    userId: userId ?? null,
+    boundary,
+    categories: assessment.categories,
+    reason: assessment.reason
+  });
+  telemetry.metric("content_safety_block_count", 1, {
+    conversationId,
+    boundary,
+    categories: assessment.categories
+  });
+}
+
+function emitJailbreakTelemetry(
+  telemetry: Telemetry,
+  conversationId: string,
+  userId: string | null | undefined,
+  boundary: string,
+  assessment: Pick<JailbreakAssessment, "categories" | "reason" | "action">
+): void {
+  const outcome = assessment.action === "block" ? "blocked" : "sanitized";
+  telemetry.event("jailbreak_attempt_detected", {
+    conversationId,
+    userId: userId ?? null,
+    boundary,
+    outcome,
+    categories: assessment.categories,
+    reason: assessment.reason
+  });
+  telemetry.metric("jailbreak_attempt_count", 1, {
+    conversationId,
+    boundary,
+    outcome,
+    categories: assessment.categories
+  });
 }
 
 function emitRedactionTelemetry(

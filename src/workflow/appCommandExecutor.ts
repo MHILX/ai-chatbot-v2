@@ -5,6 +5,8 @@ import {
   type CreateAppResult
 } from "../appBuilder/appBuilderClient";
 import { appSpecSchema } from "../domain/appSpec";
+import { assessAppSpecSafety, type ContentSafetyAssessment } from "../domain/contentSafety";
+import { assessAppSpecJailbreak, type JailbreakAssessment } from "../domain/jailbreakResistance";
 import { getMissingFields } from "../domain/validation";
 import { getErrorAttributes, noopTelemetry, type Telemetry } from "../observability/telemetry";
 import type { AppCommandRecord, CreateAppCommand } from "./appCommand";
@@ -101,6 +103,42 @@ export async function executeCreateAppCommand(input: ExecuteCreateAppCommandInpu
   }
 
   const validatedAppSpec = appSpecValidation.data;
+  const jailbreak = assessAppSpecJailbreak(validatedAppSpec);
+
+  if (jailbreak.detected) {
+    const error = new Error("Cannot execute app creation because the app spec violates jailbreak resistance policy.");
+    commandRecord = markAppCommandRejected(commandRecord, "jailbreak_resistance", error);
+    await input.commandRepository?.save(commandRecord);
+    telemetry.event("app_command_execution_rejected", {
+      commandId: command.id,
+      commandType: command.type,
+      conversationId: command.conversationId,
+      riskLevel: command.riskLevel,
+      reason: "jailbreak_resistance",
+      categories: jailbreak.categories
+    });
+    emitJailbreakTelemetry(telemetry, command, "app_command", jailbreak);
+    throw error;
+  }
+
+  const contentSafety = assessAppSpecSafety(validatedAppSpec);
+
+  if (!contentSafety.allowed) {
+    const error = new Error("Cannot execute app creation because the app spec violates content safety policy.");
+    commandRecord = markAppCommandRejected(commandRecord, "content_safety", error);
+    await input.commandRepository?.save(commandRecord);
+    telemetry.event("app_command_execution_rejected", {
+      commandId: command.id,
+      commandType: command.type,
+      conversationId: command.conversationId,
+      riskLevel: command.riskLevel,
+      reason: "content_safety",
+      categories: contentSafety.categories
+    });
+    emitContentSafetyTelemetry(telemetry, command, "app_command", contentSafety);
+    throw error;
+  }
+
   const missingFields = getMissingFields(validatedAppSpec);
 
   if (missingFields.length > 0) {
@@ -291,6 +329,53 @@ function emitRedactionTelemetry(
   telemetry.metric("sensitive_data_redaction_count", redactionCount, {
     conversationId: command.conversationId,
     boundary
+  });
+}
+
+function emitContentSafetyTelemetry(
+  telemetry: Telemetry,
+  command: CreateAppCommand,
+  boundary: string,
+  assessment: ContentSafetyAssessment
+): void {
+  telemetry.event("content_safety_blocked", {
+    commandId: command.id,
+    commandType: command.type,
+    conversationId: command.conversationId,
+    userId: command.requestedBy,
+    boundary,
+    categories: assessment.categories,
+    reason: assessment.reason
+  });
+  telemetry.metric("content_safety_block_count", 1, {
+    conversationId: command.conversationId,
+    boundary,
+    categories: assessment.categories
+  });
+}
+
+function emitJailbreakTelemetry(
+  telemetry: Telemetry,
+  command: CreateAppCommand,
+  boundary: string,
+  assessment: Pick<JailbreakAssessment, "categories" | "reason" | "action">
+): void {
+  const outcome = assessment.action === "block" ? "blocked" : "sanitized";
+  telemetry.event("jailbreak_attempt_detected", {
+    commandId: command.id,
+    commandType: command.type,
+    conversationId: command.conversationId,
+    userId: command.requestedBy,
+    boundary,
+    outcome,
+    categories: assessment.categories,
+    reason: assessment.reason
+  });
+  telemetry.metric("jailbreak_attempt_count", 1, {
+    conversationId: command.conversationId,
+    boundary,
+    outcome,
+    categories: assessment.categories
   });
 }
 
