@@ -2,10 +2,13 @@ import fastify from "fastify";
 import { describe, expect, it } from "vitest";
 import type { AppBuilderClient } from "../../src/appBuilder/appBuilderClient";
 import { appendMessage, createConversationState } from "../../src/domain/conversationState";
-import type { ConfirmationDecision } from "../../src/domain/confirmation";
+import { createUserPreferences } from "../../src/domain/userPreferences";
 import type { LlmClient } from "../../src/llm/llmClient";
+import { InMemoryAppCommandRepository } from "../../src/persistence/inMemoryAppCommandRepository";
 import { InMemoryConversationRepository } from "../../src/persistence/inMemoryConversationRepository";
+import { InMemoryUserPreferencesRepository } from "../../src/persistence/inMemoryUserPreferencesRepository";
 import { registerChatRoutes } from "../../src/routes/chatRoutes";
+import { createPlannedAppCommandRecord, type CreateAppCommand } from "../../src/workflow/appCommand";
 
 const llmClient: LlmClient = {
   async extractAppSpec() {
@@ -16,9 +19,6 @@ const llmClient: LlmClient = {
   },
   async generateConfirmationSummary() {
     return "Ready to create this app?";
-  },
-  async classifyConfirmation(): Promise<ConfirmationDecision> {
-    return "ambiguous";
   }
 };
 
@@ -36,6 +36,8 @@ describe("chat routes", () => {
   it("returns saved conversation state", async () => {
     const server = fastify();
     const repository = new InMemoryConversationRepository();
+    const userPreferencesRepository = new InMemoryUserPreferencesRepository();
+    const commandRepository = new InMemoryAppCommandRepository();
     const state = createConversationState("conv_1", "user_1");
 
     state.status = "awaiting_confirmation";
@@ -50,8 +52,20 @@ describe("chat routes", () => {
     appendMessage(state, "user", "I want to build a mobile app");
     appendMessage(state, "assistant", "Should we proceed with creating this app now?");
     await repository.save(state);
+    await userPreferencesRepository.save({
+      ...createUserPreferences("user_1", "2026-05-18T00:00:00.000Z"),
+      preferredAppType: "other",
+      preferredDeploymentTarget: "mobile"
+    });
+    await commandRepository.save(createPlannedAppCommandRecord(createCommand(state)));
 
-    await registerChatRoutes(server, { repository, llmClient, appBuilder });
+    await registerChatRoutes(server, {
+      repository,
+      userPreferencesRepository,
+      commandRepository,
+      llmClient,
+      appBuilder
+    });
 
     const response = await server.inject({
       method: "GET",
@@ -71,7 +85,21 @@ describe("chat routes", () => {
       requiredFields: ["appType", "purpose", "targetUsers", "coreFeatures"],
       contextWindow: {
         status: "ok"
-      }
+      },
+      userPreferences: {
+        preferredAppType: "other",
+        preferredDeploymentTarget: "mobile"
+      },
+      commands: [
+        {
+          status: "planned",
+          command: {
+            id: "create_app:conv_1:test",
+            idempotencyKey: "create_app:conv_1:test",
+            type: "create_app"
+          }
+        }
+      ]
     });
   });
 
@@ -89,3 +117,23 @@ describe("chat routes", () => {
     expect(response.statusCode).toBe(404);
   });
 });
+
+function createCommand(state: ReturnType<typeof createConversationState>): CreateAppCommand {
+  return {
+    id: "create_app:conv_1:test",
+    type: "create_app",
+    idempotencyKey: "create_app:conv_1:test",
+    conversationId: state.conversationId,
+    requestedBy: state.userId ?? null,
+    appSpec: state.appSpec,
+    riskLevel: "high",
+    approvalRequired: true,
+    approval: {
+      status: "approved",
+      approvedBy: state.userId ?? null,
+      approvedAt: "2026-05-18T00:00:00.000Z",
+      source: "explicit_user_confirmation"
+    },
+    plannedAt: "2026-05-18T00:00:00.000Z"
+  };
+}

@@ -1,6 +1,7 @@
 import type { AppSpec } from "../domain/appSpec";
 
 export interface CreateAppRequest {
+  idempotencyKey: string;
   conversationId: string;
   requestedBy: string | null;
   appSpec: AppSpec;

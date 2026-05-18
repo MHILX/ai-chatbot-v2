@@ -1,6 +1,6 @@
 import type { AppBuilderClient } from "../appBuilder/appBuilderClient";
 import { normalizePlatformDeploymentTarget, type AppSpec, type AppSpecField } from "../domain/appSpec";
-import { classifyConfirmationDeterministically, type ConfirmationDecision } from "../domain/confirmation";
+import { classifyConfirmationDeterministically } from "../domain/confirmation";
 import {
   appendMessage,
   type ChatMessage,
@@ -16,20 +16,27 @@ import {
   type ContextWindowUsage
 } from "../domain/contextWindow";
 import { mergeAppSpec } from "../domain/mergeAppSpec";
+import { createUserPreferences, mergeUserPreferencesFromAppSpec, type UserPreferences } from "../domain/userPreferences";
 import { getMissingFields, getRequiredFieldsForSpec } from "../domain/validation";
 import type { LlmClient } from "../llm/llmClient";
 import { getErrorAttributes, noopTelemetry, type Telemetry } from "../observability/telemetry";
+import type { AppCommandRepository } from "../persistence/appCommandRepository";
 import type { ConversationRepository } from "../persistence/conversationRepository";
-import { createAppFromState } from "./createAppFromState";
+import type { UserPreferencesRepository } from "../persistence/userPreferencesRepository";
+import { createPlannedAppCommandRecord, planCreateAppCommand, type AppCommandRecord } from "./appCommand";
+import { executeCreateAppCommand, type AppBuilderRetryOptions } from "./appCommandExecutor";
 
 export interface HandleChatTurnInput {
   conversationId: string;
   userId?: string | null;
   message: string;
   repository: ConversationRepository;
+  userPreferencesRepository?: UserPreferencesRepository;
+  commandRepository?: AppCommandRepository;
   llmClient: LlmClient;
   appBuilder: AppBuilderClient;
   contextWindow?: ContextWindowOptions;
+  appBuilderRetry?: AppBuilderRetryOptions;
   telemetry?: Telemetry;
 }
 
@@ -46,6 +53,8 @@ export interface ChatTurnResponse {
     appId: string;
     url: string;
   };
+  userPreferences?: UserPreferences;
+  commands?: AppCommandRecord[];
 }
 
 export async function handleChatTurn(input: HandleChatTurnInput): Promise<ChatTurnResponse> {
@@ -95,7 +104,7 @@ async function handleChatTurnInternal(
   }
 
   if (state.status === "created") {
-    return saveAndRespond(input.repository, state, getCreatedConversationResponse(input.message, state), contextWindow, telemetry, startedAt);
+    return saveAndRespond(input, state, getCreatedConversationResponse(input.message, state), contextWindow, telemetry, startedAt);
   }
 
   return handleRequirementCollectionTurn(state, input, contextWindow, telemetry, startedAt);
@@ -113,7 +122,7 @@ async function handleRequirementCollectionTurn(
       conversationId: state.conversationId,
       userId: state.userId ?? null
     });
-    return saveAndRespond(input.repository, state, getContextLimitMessage(), contextWindow, telemetry, startedAt);
+    return saveAndRespond(input, state, getContextLimitMessage(), contextWindow, telemetry, startedAt);
   }
 
   const extracted = await extractRequirements(state, input, telemetry);
@@ -124,7 +133,7 @@ async function handleRequirementCollectionTurn(
     state.confirmed = false;
     state.status = "collecting_requirements";
     state.missingFields = getMissingFields(state.appSpec);
-    return saveAndRespond(input.repository, state, casualResponse, contextWindow, telemetry, startedAt);
+    return saveAndRespond(input, state, casualResponse, contextWindow, telemetry, startedAt);
   }
 
   return applyRequirementsAndRespond(state, input, contextWindow, telemetry, startedAt, extracted);
@@ -161,7 +170,7 @@ async function applyRequirementsAndRespond(
       conversationId: state.conversationId
     });
 
-    return saveAndRespond(input.repository, state, response, contextWindow, telemetry, startedAt);
+    return saveAndRespond(input, state, response, contextWindow, telemetry, startedAt);
   }
 
   state.readyToBuild = true;
@@ -174,7 +183,7 @@ async function applyRequirementsAndRespond(
     userId: state.userId ?? null,
     appType: state.appSpec.appType ?? null
   });
-  return saveAndRespond(input.repository, state, response, contextWindow, telemetry, startedAt);
+  return saveAndRespond(input, state, response, contextWindow, telemetry, startedAt);
 }
 
 async function handleConfirmationTurn(
@@ -185,7 +194,7 @@ async function handleConfirmationTurn(
   startedAt: number
 ): Promise<ChatTurnResponse> {
   const deterministicDecision = classifyConfirmationDeterministically(input.message);
-  let decision = deterministicDecision;
+  const decision = deterministicDecision;
 
   if (deterministicDecision === "ambiguous") {
     const requirementChangeResponse = await tryHandleConfirmationRequirementChange(
@@ -198,8 +207,6 @@ async function handleConfirmationTurn(
     if (requirementChangeResponse) {
       return requirementChangeResponse;
     }
-
-    decision = await classifyConfirmation(state, input, contextWindow);
   }
 
   telemetry.event("confirmation_received", {
@@ -216,11 +223,11 @@ async function handleConfirmationTurn(
     state.confirmed = false;
     state.readyToBuild = false;
     state.status = "collecting_requirements";
-    return saveAndRespond(input.repository, state, "No problem. What would you like to change?", contextWindow, telemetry, startedAt);
+    return saveAndRespond(input, state, "No problem. What would you like to change?", contextWindow, telemetry, startedAt);
   }
 
   if (decision === "ambiguous") {
-    return saveAndRespond(input.repository, state, "Please reply yes to create the app, or no if you want to change the requirements.", contextWindow, telemetry, startedAt);
+    return saveAndRespond(input, state, "Please reply yes to create the app, or no if you want to change the requirements.", contextWindow, telemetry, startedAt);
   }
 
   state.confirmed = true;
@@ -236,51 +243,48 @@ async function handleConfirmationTurn(
       appSpec: state.appSpec,
       missingFields: state.missingFields
     });
-    return saveAndRespond(input.repository, state, response, contextWindow, telemetry, startedAt);
+    return saveAndRespond(input, state, response, contextWindow, telemetry, startedAt);
   }
 
-  const appBuilderStartedAt = Date.now();
-  telemetry.event("app_builder_call_started", {
+  const command = planCreateAppCommand(state);
+  await input.commandRepository?.save(createPlannedAppCommandRecord(command));
+  telemetry.event("app_command_planned", {
+    commandId: command.id,
+    commandType: command.type,
     conversationId: state.conversationId,
     userId: state.userId ?? null,
+    riskLevel: command.riskLevel,
+    approvalRequired: command.approvalRequired,
+    approvalSource: command.approval?.source,
     appType: state.appSpec.appType ?? null
   });
 
   try {
-    const result = await createAppFromState(state, input.appBuilder);
-    const appBuilderLatencyMs = Date.now() - appBuilderStartedAt;
+    const execution = await executeCreateAppCommand({
+      command,
+      appBuilder: input.appBuilder,
+      commandRepository: input.commandRepository,
+      retry: input.appBuilderRetry,
+      telemetry
+    });
+    const result = execution.result;
     state.status = "created";
     state.createdAppId = result.appId;
     state.createdAppUrl = result.url;
-    telemetry.event("app_builder_call_completed", {
-      conversationId: state.conversationId,
-      userId: state.userId ?? null,
-      appId: result.appId,
-      latencyMs: appBuilderLatencyMs
-    });
-    telemetry.metric("app_creation_success_count", 1, {
-      conversationId: state.conversationId
-    });
-    telemetry.metric("app_builder_latency_ms", appBuilderLatencyMs, {
-      conversationId: state.conversationId
-    });
-    return saveAndRespond(input.repository, state, `Created the app. You can open it at ${result.url}.`, contextWindow, telemetry, startedAt, {
+    return saveAndRespond(input, state, `Created the app. You can open it at ${result.url}.`, contextWindow, telemetry, startedAt, {
       appId: result.appId,
       url: result.url
     });
   } catch (error) {
-    const appBuilderLatencyMs = Date.now() - appBuilderStartedAt;
     state.status = "failed";
-    telemetry.event("app_builder_call_failed", {
+    telemetry.event("app_command_failed_to_complete", {
+      commandId: command.id,
+      commandType: command.type,
       conversationId: state.conversationId,
       userId: state.userId ?? null,
-      latencyMs: appBuilderLatencyMs,
       ...getErrorAttributes(error)
     });
-    telemetry.metric("app_creation_failure_count", 1, {
-      conversationId: state.conversationId
-    });
-    return saveAndRespond(input.repository, state, "I could not create the app because the app builder failed. Your requirements are saved, so you can try again in a moment.", contextWindow, telemetry, startedAt);
+    return saveAndRespond(input, state, "I could not create the app because the app builder failed. Your requirements are saved, so you can try again in a moment.", contextWindow, telemetry, startedAt);
   }
 }
 
@@ -353,28 +357,8 @@ async function extractRequirements(
   return extracted;
 }
 
-async function classifyConfirmation(
-  state: ConversationState,
-  input: HandleChatTurnInput,
-  contextWindow: ContextWindowOptions
-): Promise<ConfirmationDecision> {
-  const deterministic = classifyConfirmationDeterministically(input.message);
-  if (deterministic !== "ambiguous") {
-    return deterministic;
-  }
-
-  if (getContextWindowUsage(state, contextWindow).status === "blocked") {
-    return "ambiguous";
-  }
-
-  return input.llmClient.classifyConfirmation({
-    userMessage: input.message,
-    appSpec: state.appSpec
-  });
-}
-
 async function saveAndRespond(
-  repository: ConversationRepository,
+  input: HandleChatTurnInput,
   state: ConversationState,
   message: string,
   contextWindow: ContextWindowOptions,
@@ -384,7 +368,8 @@ async function saveAndRespond(
 ): Promise<ChatTurnResponse> {
   appendMessage(state, "assistant", message);
   compactConversationForContext(state, contextWindow);
-  await repository.save(state);
+  const userPreferences = await saveUserPreferences(input.userPreferencesRepository, state);
+  await input.repository.save(state);
   const latencyMs = Date.now() - startedAt;
   telemetry.event("chat_turn_completed", {
     conversationId: state.conversationId,
@@ -397,6 +382,8 @@ async function saveAndRespond(
     status: state.status
   });
 
+  const commands = await input.commandRepository?.listByConversationId(state.conversationId);
+
   return {
     conversationId: state.conversationId,
     status: state.status,
@@ -406,8 +393,24 @@ async function saveAndRespond(
     missingFields: state.missingFields,
     requiredFields: getRequiredFieldsForSpec(state.appSpec),
     contextWindow: getContextWindowUsage(state, contextWindow),
-    createdApp
+    createdApp,
+    userPreferences,
+    commands
   };
+}
+
+async function saveUserPreferences(
+  repository: UserPreferencesRepository | undefined,
+  state: ConversationState
+): Promise<UserPreferences | undefined> {
+  if (!repository || !state.userId) {
+    return undefined;
+  }
+
+  const existingPreferences = await repository.get(state.userId) ?? createUserPreferences(state.userId);
+  const nextPreferences = mergeUserPreferencesFromAppSpec(existingPreferences, state.appSpec);
+  await repository.save(nextPreferences);
+  return nextPreferences;
 }
 
 function getContextLimitMessage(): string {

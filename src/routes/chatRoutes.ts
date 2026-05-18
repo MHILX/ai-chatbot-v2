@@ -7,10 +7,14 @@ import {
   type ContextWindowOptions
 } from "../domain/contextWindow";
 import type { ConversationState } from "../domain/conversationState";
+import type { UserPreferences } from "../domain/userPreferences";
 import type { LlmClient } from "../llm/llmClient";
 import { createCompositeTelemetry, createLoggerTelemetry, type Telemetry } from "../observability/telemetry";
+import type { AppCommandRepository } from "../persistence/appCommandRepository";
 import type { ConversationRepository } from "../persistence/conversationRepository";
+import type { UserPreferencesRepository } from "../persistence/userPreferencesRepository";
 import { getRequiredFieldsForSpec } from "../domain/validation";
+import type { AppCommandRecord } from "../workflow/appCommand";
 import { handleChatTurn } from "../workflow/handleChatTurn";
 
 const chatRequestSchema = z.object({
@@ -25,6 +29,8 @@ const conversationParamsSchema = z.object({
 
 export interface ChatRouteDependencies {
   repository: ConversationRepository;
+  userPreferencesRepository?: UserPreferencesRepository;
+  commandRepository?: AppCommandRepository;
   llmClient: LlmClient;
   appBuilder: AppBuilderClient;
   contextWindow?: ContextWindowOptions;
@@ -56,7 +62,14 @@ export async function registerChatRoutes(server: FastifyInstance, dependencies: 
       return reply.code(404).send({ error: "Conversation not found." });
     }
 
-    return reply.send(serializeConversationState(state, contextWindow));
+    const [userPreferences, commands] = await Promise.all([
+      state.userId && dependencies.userPreferencesRepository
+        ? dependencies.userPreferencesRepository.get(state.userId)
+        : undefined,
+      dependencies.commandRepository?.listByConversationId(state.conversationId)
+    ]);
+
+    return reply.send(serializeConversationState(state, contextWindow, userPreferences, commands));
   });
 
   server.post("/api/chat", async (request, reply) => {
@@ -77,6 +90,8 @@ export async function registerChatRoutes(server: FastifyInstance, dependencies: 
       const response = await handleChatTurn({
         ...parsed.data,
         repository: dependencies.repository,
+        userPreferencesRepository: dependencies.userPreferencesRepository,
+        commandRepository: dependencies.commandRepository,
         llmClient: dependencies.llmClient,
         appBuilder: dependencies.appBuilder,
         contextWindow,
@@ -93,7 +108,12 @@ export async function registerChatRoutes(server: FastifyInstance, dependencies: 
   });
 }
 
-function serializeConversationState(state: ConversationState, contextWindow: ContextWindowOptions) {
+function serializeConversationState(
+  state: ConversationState,
+  contextWindow: ContextWindowOptions,
+  userPreferences?: UserPreferences,
+  commands?: AppCommandRecord[]
+) {
   return {
     conversationId: state.conversationId,
     status: state.status,
@@ -105,6 +125,8 @@ function serializeConversationState(state: ConversationState, contextWindow: Con
     createdApp: state.createdAppId && state.createdAppUrl ? {
       appId: state.createdAppId,
       url: state.createdAppUrl
-    } : undefined
+    } : undefined,
+    userPreferences,
+    commands
   };
 }

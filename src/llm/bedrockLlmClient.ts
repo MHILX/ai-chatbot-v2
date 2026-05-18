@@ -1,19 +1,16 @@
 import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
 import { partialAppSpecSchema, type PartialAppSpec } from "../domain/appSpec";
-import type { ConfirmationDecision } from "../domain/confirmation";
 import type { AppConfig } from "../config";
 import { getErrorAttributes, noopTelemetry, type Telemetry } from "../observability/telemetry";
 import { isRetryableServiceError, withRetry } from "../reliability/retry";
 import type {
   ClarifyingQuestionInput,
-  ConfirmationInput,
   ConfirmationSummaryInput,
   ExtractAppSpecInput,
   LlmClient
 } from "./llmClient";
 import {
   buildClarifyingQuestionPrompt,
-  buildConfirmationClassificationPrompt,
   buildConfirmationSummaryPrompt,
   buildExtractionPrompt,
   buildJsonRepairPrompt
@@ -81,21 +78,6 @@ export class BedrockLlmClient implements LlmClient {
       buildConfirmationSummaryPrompt(input.appSpec)
     );
     return normalizeAssistantText(text);
-  }
-
-  async classifyConfirmation(input: ConfirmationInput): Promise<ConfirmationDecision> {
-    const text = await this.sendText(
-      "You classify confirmation replies.",
-      buildConfirmationClassificationPrompt(input.userMessage, input.appSpec),
-      20
-    );
-
-    const normalized = text.trim().toLowerCase();
-    if (normalized === "yes" || normalized === "no" || normalized === "ambiguous") {
-      return normalized;
-    }
-
-    return "ambiguous";
   }
 
   private async sendText(systemPrompt: string, userPrompt: string, maxTokens = this.config.bedrockMaxTokens): Promise<string> {
